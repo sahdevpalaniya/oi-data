@@ -101,6 +101,13 @@ function matchedOiDelta(refByStrike, curByStrike) {
   return { ceDelta, peDelta };
 }
 
+const clamp01 = (v) => (v < 0 ? 0 : v > 1 ? 1 : v);
+
+// Confidence weights — must sum to 1. Structural cap: with price diverging
+// (priceFactor 0) the max reachable score is w_pcr + w_flow = 0.70, so a
+// divergent tick can never clear ~70% no matter how strong the OI flow.
+const CONF_W = { pcr: 0.30, flow: 0.40, price: 0.30 };
+
 function computeBias(history, latest) {
   const cutoff = latest.ts - LOOKBACK_MIN * 60 * 1000;
   let ref = null;
@@ -125,26 +132,54 @@ function computeBias(history, latest) {
   const peN = peDelta / std(peDeltas);
   const net = peN - ceN;
 
+  // ---- Fix #3: price / trend confirmation ----
+  // Direction the OI (seller-view) bias points, and the direction spot actually
+  // moved over the same lookback. A deadband of 0.03% of spot ignores flat noise.
+  const biasDir = Math.abs(netFlow) > 10000 ? (net > 0 ? 1 : net < 0 ? -1 : 0) : 0;
+  const priceChg = (latest.spot != null && ref.spot != null) ? latest.spot - ref.spot : 0;
+  const priceBand = (latest.spot ?? 0) * 0.0003;
+  const priceDir = priceChg > priceBand ? 1 : priceChg < -priceBand ? -1 : 0;
+  const confirmed = biasDir !== 0 && priceDir === biasDir;
+  const divergence = biasDir !== 0 && priceDir !== 0 && priceDir !== biasDir;
+
   // Bias polarity — option-WRITER (seller) view, the standard OI-writing read:
   //   net > 0  => puts written faster than calls => support building => BULLISH
   //   net < 0  => calls written faster => resistance building => BEARISH
   // Do NOT invert this to "trade as a buyer". To trade against the signal use the
   // FADE book in paper/autoPaperTrader.js — that keeps this label correct while
   // still letting you test fading. See memory: auto-paper-follow-vs-fade.
+  // "Strong" is only emitted when spot CONFIRMS the OI direction (Fix #3);
+  // otherwise a strong OI reading against price is downgraded to plain
+  // directional and flagged as a divergence for the UI / paper trader.
   let bias = "Neutral";
   if (Math.abs(netFlow) > 10000) {
-    if (net > 1.5)        bias = "Strong Bullish";
+    if (net > 1.5)        bias = confirmed ? "Strong Bullish" : "Bullish";
     else if (net > 0.5)   bias = "Bullish";
-    else if (net < -1.5)  bias = "Strong Bearish";
+    else if (net < -1.5)  bias = confirmed ? "Strong Bearish" : "Bearish";
     else if (net < -0.5)  bias = "Bearish";
   }
+
+  // ---- Fix #1: multi-factor bounded confidence (replaces |net|*40 saturation) ----
+  //   PCR conviction  — how far PCR sits from the neutral 1.0 (½-unit = full).
+  //   Flow conviction — normalized net writing strength, |net|/3 = full.
+  //   Price factor    — 1 when spot confirms, 0 when it diverges, 0.5 when flat.
+  const pcrConv  = clamp01(Math.abs(pcrOI - 1.0) / 0.5);
+  const flowConv = clamp01(Math.abs(net) / 3);
+  const priceFactor = confirmed ? 1 : divergence ? 0 : 0.5;
+  const strength = round(
+    (CONF_W.pcr * pcrConv + CONF_W.flow * flowConv + CONF_W.price * priceFactor) * 100,
+    0
+  );
 
   return {
     ready: true,
     ceDelta, peDelta, netFlow, pcrOI: round(pcrOI, 3),
     ceN: round(ceN, 2), peN: round(peN, 2), net: round(net, 2),
     bias,
-    strength: round(Math.min(Math.abs(net) * 40, 100), 0),
+    divergence,
+    priceDir,
+    priceChg: round(priceChg, 2),
+    strength,
   };
 }
 
@@ -313,6 +348,20 @@ export async function startOiTest({ jwtToken, apiKey }) {
 
           const latest = { ts: Date.now(), ceTotal, peTotal, spot: curSpot, byStrike };
 
+          // Fix #2: ATM-band PCR (±5 strikes) alongside the full ±10 chain PCR.
+          // The full-chain number (peTotal/ceTotal) covers the 21-strike window
+          // we poll — label it as such; the band number is how most desks read
+          // PCR intraday. Neither is "all strikes", so both are scoped in the UI.
+          const PCR_BAND = 5;
+          let ceBand = 0, peBand = 0;
+          for (const k of Object.keys(byStrike)) {
+            if (Math.abs((+k - state.atm) / STRIKE_STEP) > PCR_BAND) continue;
+            const c = byStrike[k];
+            if (c.ce?.oi != null) ceBand += c.ce.oi;
+            if (c.pe?.oi != null) peBand += c.pe.oi;
+          }
+          const pcrBandOI = ceBand > 0 ? round(peBand / ceBand, 3) : null;
+
           // Build per-strike chain view with delta vs STRIKE_LOOKBACK_MIN ago.
           const cutoff = latest.ts - STRIKE_LOOKBACK_MIN * 60 * 1000;
           let refTick = null;
@@ -389,8 +438,11 @@ export async function startOiTest({ jwtToken, apiKey }) {
             peDelta: r.peDelta ?? null,
             netFlow: r.netFlow ?? null,
             pcrOI: r.pcrOI ?? null,
+            pcrBandOI,
             net: r.net ?? null,
             bias: r.ready ? r.bias : "WARMUP",
+            divergence: r.divergence ?? false,
+            priceDir: r.priceDir ?? null,
             strength: r.strength ?? null,
           });
           if (state.ticks.length > 1000) state.ticks.length = 1000;
@@ -406,6 +458,7 @@ export async function startOiTest({ jwtToken, apiKey }) {
             bias: r.ready ? r.bias : null,
             net: r.net ?? null,
             strength: r.strength ?? null,
+            divergence: r.divergence ?? false,
             byStrike,
           });
         } catch (e) {

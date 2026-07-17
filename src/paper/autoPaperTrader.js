@@ -336,9 +336,12 @@ export function onOiTick(tick) {
     const cfg = state.config;
 
     // 1) update the signal-confirmation tracker
-    //    Only "Strong" signals qualify, AND strength must be ≥ 60%
-    const strong = (tick.bias === "Strong Bullish" || tick.bias === "Strong Bearish"
-      || (Number.isFinite(tick.net) && Math.abs(tick.net) >= cfg.strongNet))
+    //    Only "Strong" signals qualify, AND strength must be ≥ 60%, AND the OI
+    //    read must not be diverging from spot (Fix #3 — no entries when price
+    //    disagrees with the OI direction, even if |net| is large).
+    const strong = !tick.divergence
+      && (tick.bias === "Strong Bullish" || tick.bias === "Strong Bearish"
+        || (Number.isFinite(tick.net) && Math.abs(tick.net) >= cfg.strongNet))
       && (tick.strength == null || tick.strength >= 60);
     const sigDir = Number.isFinite(tick.net) ? (tick.net > 0 ? "BULL" : "BEAR") : null;
     if (strong && sigDir) {
