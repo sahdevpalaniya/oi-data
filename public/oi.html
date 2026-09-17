@@ -98,7 +98,7 @@
       .ohlc-cell.low .val{color:var(--danger)}
       .ohlc-cell .pos{color:var(--ok)}
       .ohlc-cell .neg{color:var(--danger)}
-      #oiStrip{grid-template-columns:repeat(4,1fr)}
+      #oiStrip{grid-template-columns:repeat(5,1fr)}
       @media (max-width:760px){
         .ohlc{grid-template-columns:repeat(3,1fr);gap:8px;margin-bottom:12px}
         #oiStrip{grid-template-columns:repeat(2,1fr)}
@@ -265,7 +265,8 @@
         <div class="ohlc-cell"><div class="lbl">Total Call OI</div><div class="val" id="oiCall">–</div><div class="sub" id="oiCallChg">&nbsp;</div></div>
         <div class="ohlc-cell"><div class="lbl">Total Put OI</div><div class="val" id="oiPut">–</div><div class="sub" id="oiPutChg">&nbsp;</div></div>
         <div class="ohlc-cell"><div class="lbl">Net OI Flow</div><div class="val" id="oiNet">–</div><div class="sub">Put Δ − Call Δ</div></div>
-        <div class="ohlc-cell"><div class="lbl" title="Full ±10-strike chain PCR · ATM ±5 band PCR in the sub-line">PCR (±10 · ±5)</div><div class="val" id="oiPcr">–</div><div class="sub" id="oiBias">&nbsp;</div></div>
+        <div class="ohlc-cell"><div class="lbl" title="PCR over the full pinned ±15-strike window · ATM ±5 band PCR in the sub-line. The window is pinned at the day's opening ATM so these numbers cannot jump when spot drifts across a strike.">PCR (±15 · ±5)</div><div class="val" id="oiPcr">–</div><div class="sub" id="oiBias">&nbsp;</div></div>
+        <div class="ohlc-cell"><div class="lbl" title="OI added since the tracker's first tick today, summed per strike. Puts written faster than calls = support building = bullish. This is the writing signal — snapshot PCR above is dominated by OI carried over from previous days and barely moves intraday.">Written Today (P ÷ C)</div><div class="val" id="oiDayPcr">–</div><div class="sub" id="oiDayChg">&nbsp;</div></div>
       </div>
 
       <div class="ohlc" id="ohlcStrip" style="display:none">
@@ -410,7 +411,7 @@
       .ocp-toolbar select{padding:5px 8px;border:1px solid var(--border);border-radius:8px;background:var(--panel-2);color:var(--text);font-size:12.5px}
       .ocp-wrap{
         border:1px solid var(--border);border-radius:10px;background:var(--panel);
-        overflow-x:hidden;overflow-y:auto;max-height:680px;-webkit-overflow-scrolling:touch;
+        overflow-x:auto;overflow-y:auto;max-height:680px;-webkit-overflow-scrolling:touch;
         width:100%;
       }
       .ocp-table{
@@ -571,10 +572,9 @@
               </tbody>
             </table>
           </div>
-          <p style="margin:10px 0 0;font-size:11.5px;color:var(--muted)">
-            Demo data — green = positive change, red = negative, yellow = strike,
-            blue = highlighted strikes near ATM. Wire to <code>/api/oi/state</code>'s
-            <code>strikes[]</code> for live data.
+          <p id="ocpCaption" style="margin:10px 0 0;font-size:11.5px;color:var(--muted)">
+            Green = positive change, red = negative, yellow = strike,
+            blue = highlighted strikes near ATM.
           </p>
         </div>
       </div>
@@ -753,23 +753,30 @@
           + '<th>Call OI Change</th>'
           + '<th>Put OI Change</th>'
           + '<th>Net OI Flow</th>'
-          + '<th title="Put/Call OI ratio over the full ±10-strike chain we poll">PCR ±10</th>'
+          + '<th title="Put/Call OI ratio over the full ±15-strike window we poll (pinned at the opening ATM)">PCR ±15</th>'
           + '<th title="Put/Call OI ratio over the ATM ±5 band — how most desks read intraday PCR">PCR ±5</th>'
+          + '<th title="Puts written ÷ calls written since the first tick today. Above 1 = put writing dominant = bullish.">Written P÷C</th>'
           + '<th>Signal</th>'
           + '<th>Confidence</th>'
           + '<th>Market Bias</th>'
           + '</tr></thead><tbody>';
         for (const t of ticks) {
-          html += '<tr>'
-            + '<td class="time" data-label="Time">' + escHtml(t.tsIST || fmtTime(t.ts)) + '</td>'
+          // Exchange OI refreshes once a minute, we poll every 30s: a tick whose
+          // OI is byte-identical to the one before it carries no new information.
+          // Mute it so a row of zeros is not read as "no writing happening".
+          const stale = t.oiChanged === false;
+          html += '<tr' + (stale ? ' style="opacity:.45" title="No new OI from the exchange since the previous tick"' : '') + '>'
+            + '<td class="time" data-label="Time">' + escHtml(t.tsIST || fmtTime(t.ts)) + (stale ? ' ·' : '') + '</td>'
             + '<td class="num spot" data-label="Spot">' + escHtml(t.spot) + '</td>'
             + '<td class="num" data-label="Call OI">' + fmtOI(t.ceTotal) + '</td>'
             + '<td class="num" data-label="Put OI">' + fmtOI(t.peTotal) + '</td>'
             + '<td class="' + signedCls(t.ceDelta) + '" data-label="Call ΔOI">' + fmtOISigned(t.ceDelta) + '</td>'
             + '<td class="' + signedCls(t.peDelta) + '" data-label="Put ΔOI">' + fmtOISigned(t.peDelta) + '</td>'
             + '<td class="' + signedCls(t.netFlow) + '" data-label="Net Flow">' + fmtOISigned(t.netFlow) + '</td>'
-            + '<td class="num" data-label="PCR ±10">' + escHtml(t.pcrOI ?? "-") + '</td>'
+            + '<td class="num" data-label="PCR ±15">' + escHtml(t.pcrOI ?? "-") + '</td>'
             + '<td class="num" data-label="PCR ±5">' + escHtml(t.pcrBandOI ?? "-") + '</td>'
+            + '<td class="' + (t.pcrDayChange == null ? 'num' : t.pcrDayChange > 1 ? 'pos' : 'neg') + '" data-label="Written P÷C">'
+              + escHtml(t.pcrDayChange != null ? (+t.pcrDayChange).toFixed(2) : "-") + '</td>'
             + '<td class="' + signedCls(t.net) + '" data-label="Signal">' + escHtml(t.net ?? "-") + '</td>'
             + '<td class="num" data-label="Confidence">' + escHtml(t.strength != null ? t.strength + "%" : "-") + '</td>'
             + '<td data-label="Bias">' + biasBadge(t.bias, t.divergence) + '</td>'
@@ -827,6 +834,16 @@
         $("oiPcr").textContent = t.pcrOI != null
           ? (+t.pcrOI).toFixed(3) + (t.pcrBandOI != null ? " · " + (+t.pcrBandOI).toFixed(3) : "")
           : "–";
+
+        // Day-cumulative writing — the number that actually swings intraday.
+        const dayPcrEl = $("oiDayPcr");
+        if (t.pcrDayChange != null) {
+          const cls = t.pcrDayChange > 1 ? "pos" : t.pcrDayChange < 1 ? "neg" : "";
+          dayPcrEl.innerHTML = '<span class="' + cls + '">' + (+t.pcrDayChange).toFixed(2) + '</span>';
+        } else { dayPcrEl.textContent = "–"; }
+        $("oiDayChg").innerHTML = (t.ceDayDelta != null && t.peDayDelta != null)
+          ? 'C ' + fmtOISigned(t.ceDayDelta) + ' · P ' + fmtOISigned(t.peDayDelta)
+          : "&nbsp;";
         const biasEl = $("oiBias");
         if (t.bias && t.bias !== "WARMUP") {
           const cls = t.bias.includes("Bullish") ? "pos" : t.bias.includes("Bearish") ? "neg" : "";
@@ -1342,7 +1359,7 @@
         const window = all.slice(lo, hi);
         const now = new Date();
         const time = `${String(now.getHours()).padStart(2,"0")}:${String(now.getMinutes()).padStart(2,"0")}:${String(now.getSeconds()).padStart(2,"0")}`;
-        const spot = snap.ohlc?.current ?? snap.spotOpen ?? atm;
+        const spot = snap.ohlc?.ltp ?? snap.spotOpen ?? atm;
         const expiry = snap.expiry || "—";
         const rows = window.map(s => {
           const peLtpPct = (s.peLtp && s.peLtpDelta != null) ? (s.peLtpDelta / s.peLtp) * 100 : null;
@@ -1366,6 +1383,13 @@
         document.getElementById("ocpExpiry").textContent  = "Expiry " + data.expiry;
         document.getElementById("ocpAtm").textContent     = "ATM " + data.atm;
         document.getElementById("ocpUpdated").textContent = "Updated " + data.time + (live ? " · live" : " · demo");
+        const cap = document.getElementById("ocpCaption");
+        if (cap) {
+          cap.innerHTML = live
+            ? 'Live from <code>/api/oi/state</code>. Green = positive change, red = negative, '
+              + 'yellow = strike, blue = highlighted strikes near ATM.'
+            : '<b style="color:var(--warn)">Demo data — not live.</b> No snapshot for this symbol yet.';
+        }
         ocpRenderRows(data);
       }
       document.getElementById("ocpSymbol").addEventListener("change", renderChainPro);

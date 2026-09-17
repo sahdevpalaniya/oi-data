@@ -6,7 +6,7 @@ import { loadInstruments, fetchQuotes } from "./brokers/angelMarketData.js";
 import { appendSnapshot } from "./signal/oiSnapshotWriter.js";
 import { onOiTick as autoPaperTick, openTradeLegs, refreshOpenMarks } from "./paper/autoPaperTrader.js";
 import { marketStatus as getMarketStatus } from "./marketClock.js";
-import { impliedVolatility, yearsToExpiry } from "./signal/iv.js";
+import { impliedVolatilityFwd, forwardFromParity, yearsToExpiry } from "./signal/iv.js";
 
 const POLL_SEC = 30;
 const LOOKBACK_MIN = 15;
@@ -14,6 +14,15 @@ const LOOKBACK_MIN = 15;
 // 15 min is too noisy for per-strike classification.
 const STRIKE_LOOKBACK_MIN = 60;
 const STRIKE_STEP = 50;
+// Strike window is PINNED for the whole trading day at open-ATM +/- DAY_BAND.
+// It used to re-center on live ATM, which swapped a deep strike in/out of the
+// window and moved Total Call/Put OI (and therefore PCR) by up to 10% in a
+// single tick with no trade behind it. 15 strikes = +/-750 pts, wider than
+// NIFTY's daily range, so the band still covers the market without moving.
+const DAY_BAND = 15;
+// PCR is still read over ATM +/- 5, and that band DOES follow live ATM - which
+// is correct, and safe now that the pinned window always has those strikes.
+const PCR_BAND = 5;
 
 const istNow = () =>
   new Date(new Date().toLocaleString("en-US", { timeZone: "Asia/Kolkata" }));
@@ -51,10 +60,9 @@ function findNearestWeeklyExpiry(instruments) {
   return best;
 }
 
-function pickStrikes(instruments, expiryStr, atm) {
-  // 21 strikes: 10 below ATM, ATM, 10 above ATM.
+function pickStrikes(instruments, expiryStr, atm, band = DAY_BAND) {
   const offsets = [];
-  for (let k = -10; k <= 10; k++) offsets.push(k);
+  for (let k = -band; k <= band; k++) offsets.push(k);
   const wanted = offsets.map((k) => atm + k * STRIKE_STEP);
   const out = [];
   for (const strike of wanted) {
@@ -99,6 +107,28 @@ function matchedOiDelta(refByStrike, curByStrike) {
     if (cur.pe?.oi != null && ref.pe?.oi != null) peDelta += cur.pe.oi - ref.pe.oi;
   }
   return { ceDelta, peDelta };
+}
+
+// Day-cumulative OI change vs the day's first tick, summed per strike. This is
+// the number every other option-chain platform shows as "OI Chg" and it is the
+// actual writing signal: a snapshot PCR is dominated by OI carried over from
+// previous days and barely moves intraday, while the day-change PCR swings hard
+// when one side is being written. Baseline is the day's first tick, so it is
+// "since tracker start", not since previous close — the Angel quote API does not
+// expose previous-day OI. Start the tracker at 09:15 and the two coincide.
+function dayDelta(base, cur) {
+  let ceDelta = 0, peDelta = 0;
+  if (!base || !cur) return { ceDelta: null, peDelta: null, pcrChange: null };
+  for (const k of Object.keys(cur)) {
+    const c = cur[k], b = base[k];
+    if (!b) continue;
+    if (c.ce?.oi != null && b.ce?.oi != null) ceDelta += c.ce.oi - b.ce.oi;
+    if (c.pe?.oi != null && b.pe?.oi != null) peDelta += c.pe.oi - b.pe.oi;
+  }
+  // Only meaningful when both sides actually added OI; unwinding on either side
+  // makes the ratio meaningless rather than "very bullish".
+  const pcrChange = (ceDelta > 0 && peDelta > 0) ? round(peDelta / ceDelta, 3) : null;
+  return { ceDelta, peDelta, pcrChange };
 }
 
 const clamp01 = (v) => (v < 0 ? 0 : v > 1 ? 1 : v);
@@ -196,6 +226,10 @@ function freshState() {
     atm: null,
     expiry: null,
     spotOpen: null,
+    forward: null,   // synthetic futures price from ATM put-call parity
+    dayAtm: null,    // ATM at first tick of the day; the pinned window's centre
+    dayBase: null,   // byStrike snapshot of the day's first tick (OI baseline)
+    dayBaseAt: null, // IST time that baseline was taken
     ohlc: null,  // { open, high, low, close, ltp, ts }
     strikes: [], // [{ strike, ceOI, peOI, ceLtp, peLtp, ceDelta, peDelta, atm }]
   };
@@ -210,8 +244,11 @@ export function getOiState() {
     status: state.status,
     startedAt: state.startedAt,
     atm: state.atm,
+    dayAtm: state.dayAtm,
     expiry: state.expiry,
     spotOpen: state.spotOpen,
+    forward: state.forward,
+    dayBaseAt: state.dayBaseAt,
     error: state.error,
     ohlc: state.ohlc,
     strikes: state.strikes || [],
@@ -250,14 +287,20 @@ export async function startOiTest({ jwtToken, apiKey }) {
       if (!spot) throw new Error("Failed to fetch NIFTY 50 spot");
       const atm = Math.round(spot / STRIKE_STEP) * STRIKE_STEP;
       state.atm = atm;
+      state.dayAtm = atm;
       state.spotOpen = spot;
 
-      const expiry = findNearestWeeklyExpiry(instruments);
+      let expiry = findNearestWeeklyExpiry(instruments);
       if (!expiry) throw new Error("No NIFTY weekly expiry found");
       state.expiry = expiry.str;
 
       let optTokens = pickStrikes(instruments, expiry.str, atm);
       if (optTokens.length === 0) throw new Error("No option tokens resolved around ATM");
+
+      // Contract lot size from the instrument master. NIFTY's lot has moved
+      // (75 -> 65); a hardcoded constant silently scales every P&L by the wrong
+      // factor, so read it from the same rows we are already quoting.
+      let lotSize = optTokens.find(t => t.lotSize)?.lotSize || null;
 
       // In-memory only — never persisted.
       let history = [];
@@ -286,6 +329,21 @@ export async function startOiTest({ jwtToken, apiKey }) {
             state.day = curDay;
             state.ticks = [];
             history = [];
+            // New day: drop the OI baseline, re-pin the strike window on the new
+            // open, and re-resolve the expiry (the weekly contract rolls, and a
+            // long-running process would otherwise keep quoting a dead one).
+            state.dayBase = null;
+            state.dayBaseAt = null;
+            const rolled = findNearestWeeklyExpiry(instruments);
+            if (rolled) { expiry = rolled; state.expiry = rolled.str; }
+            const openAtm = Math.round((state.ohlc?.ltp ?? state.atm) / STRIKE_STEP) * STRIKE_STEP;
+            state.atm = openAtm;
+            state.dayAtm = openAtm;
+            const repinned = pickStrikes(instruments, expiry.str, openAtm);
+            if (repinned.length > 0) {
+              optTokens = repinned;
+              lotSize = optTokens.find(t => t.lotSize)?.lotSize || lotSize;
+            }
           }
 
           const tokens = [
@@ -296,19 +354,13 @@ export async function startOiTest({ jwtToken, apiKey }) {
           const idx = q.NIFTY50 || {};
           const curSpot = idx.ltp ?? spot;
 
-          // Dynamic ATM with hysteresis. Only re-center the strike window once
-          // spot has drifted a clear ¾-strike past the current ATM. Without this
-          // deadband, spot jittering across a half-strike boundary (e.g. ~23975,
-          // between the 23950 and 24000 strikes) flips the ATM every poll, which
-          // swaps a deep strike in/out of the ±10 window and injects phantom
-          // 60L–1.5Cr jumps into total OI — the cause of the flip-flopping signal.
+          // Track live ATM for the ATM-band PCR and the UI highlight. The token
+          // window itself is NOT rebuilt here — it stays pinned at dayAtm for the
+          // whole session (see DAY_BAND). Re-picking tokens mid-session is what
+          // used to swap strikes in/out of the totals and fake 10% OI jumps.
           if (Math.abs(curSpot - state.atm) > STRIKE_STEP * 0.75) {
             const newAtm = Math.round(curSpot / STRIKE_STEP) * STRIKE_STEP;
-            if (newAtm !== state.atm) {
-              state.atm = newAtm;
-              const rebuilt = pickStrikes(instruments, expiry.str, newAtm);
-              if (rebuilt.length > 0) optTokens = rebuilt;
-            }
+            if (newAtm !== state.atm) state.atm = newAtm;
           }
           state.ohlc = {
             ltp: idx.ltp ?? null,
@@ -324,35 +376,74 @@ export async function startOiTest({ jwtToken, apiKey }) {
           const byStrike = {};
           const expDate = parseExpiry(state.expiry);
           const T = yearsToExpiry(expDate);
+
+          // Pass 1 — quotes only. IV needs the forward, and the forward needs the
+          // ATM call and put, so it cannot be computed inside this loop.
           for (const t of optTokens) {
             const row = q[t.symbol];
             if (!row) continue;
             if (!byStrike[t.strike]) byStrike[t.strike] = { ce: null, pe: null };
-            const isCall = t.side === "CE";
-            const iv = (row.ltp != null && curSpot != null && T != null)
-              ? impliedVolatility(row.ltp, curSpot, t.strike, T, isCall)
-              : null;
             const cell = {
               oi: row.opnInterest ?? null,
               ltp: row.ltp ?? null,
               volume: row.tradeVolume ?? null,
-              iv,
+              iv: null,
             };
-            if (isCall) byStrike[t.strike].ce = cell;
-            else        byStrike[t.strike].pe = cell;
+            if (t.side === "CE") byStrike[t.strike].ce = cell;
+            else                 byStrike[t.strike].pe = cell;
             if (row.opnInterest != null) {
-              if (isCall) ceTotal += row.opnInterest;
-              else        peTotal += row.opnInterest;
+              if (t.side === "CE") ceTotal += row.opnInterest;
+              else                 peTotal += row.opnInterest;
+            }
+          }
+
+          // Synthetic forward from put-call parity at the live ATM strike. Index
+          // options are priced off the forward; solving IV against spot biases
+          // call IV down / put IV up and invents a CE-PE skew parity forbids.
+          const atmCell = byStrike[state.atm] || {};
+          const fwd = (T != null)
+            ? forwardFromParity(atmCell.ce?.ltp, atmCell.pe?.ltp, state.atm, T)
+            : null;
+          state.forward = fwd != null ? round(fwd, 2) : null;
+
+          // Pass 2 — IV against the forward (falls back to spot only if parity
+          // was unusable, e.g. a crossed or stale ATM quote).
+          const ivRef = fwd ?? curSpot;
+          if (T != null && ivRef != null) {
+            for (const k of Object.keys(byStrike)) {
+              const strike = +k;
+              for (const side of ["ce", "pe"]) {
+                const cell = byStrike[k][side];
+                if (!cell || cell.ltp == null) continue;
+                cell.iv = impliedVolatilityFwd(cell.ltp, ivRef, strike, T, side === "ce");
+              }
             }
           }
 
           const latest = { ts: Date.now(), ceTotal, peTotal, spot: curSpot, byStrike };
 
-          // Fix #2: ATM-band PCR (±5 strikes) alongside the full ±10 chain PCR.
-          // The full-chain number (peTotal/ceTotal) covers the 21-strike window
-          // we poll — label it as such; the band number is how most desks read
-          // PCR intraday. Neither is "all strikes", so both are scoped in the UI.
-          const PCR_BAND = 5;
+          // First tick of the day sets the OI baseline everything is measured from.
+          if (!state.dayBase) {
+            state.dayBase = byStrike;
+            state.dayBaseAt = fmtIST();
+          }
+          const day = dayDelta(state.dayBase, byStrike);
+
+          // Exchange OI refreshes once a MINUTE; this loop polls every 30s, so
+          // ~30% of ticks carry no new OI at all and the next one carries a
+          // double-sized jump. Flag those so the UI can mute them and the paper
+          // trader can stop counting a repeat as an independent confirmation.
+          const prevTick = state.ticks[0];
+          const oiChanged = !prevTick
+            || prevTick.ceTotal !== ceTotal
+            || prevTick.peTotal !== peTotal;
+
+          // ATM-band PCR (±5 strikes) alongside the full-window PCR. The full
+          // number (peTotal / ceTotal) covers the pinned
+          // ±15-strike window we poll; the band number follows live ATM and is
+          // how most desks read PCR intraday. Neither is "all strikes", so both
+          // are scoped in the UI. Both are now stable: the window no longer
+          // moves, so a PCR change means OI changed, not that a strike swapped in.
           let ceBand = 0, peBand = 0;
           for (const k of Object.keys(byStrike)) {
             if (Math.abs((+k - state.atm) / STRIKE_STEP) > PCR_BAND) continue;
@@ -439,6 +530,11 @@ export async function startOiTest({ jwtToken, apiKey }) {
             netFlow: r.netFlow ?? null,
             pcrOI: r.pcrOI ?? null,
             pcrBandOI,
+            ceDayDelta: day.ceDelta,
+            peDayDelta: day.peDelta,
+            pcrDayChange: day.pcrChange,
+            oiChanged,
+            forward: state.forward,
             net: r.net ?? null,
             bias: r.ready ? r.bias : "WARMUP",
             divergence: r.divergence ?? false,
@@ -459,6 +555,8 @@ export async function startOiTest({ jwtToken, apiKey }) {
             net: r.net ?? null,
             strength: r.strength ?? null,
             divergence: r.divergence ?? false,
+            oiChanged,
+            lotSize,
             byStrike,
           });
         } catch (e) {

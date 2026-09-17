@@ -84,6 +84,52 @@ export function impliedVolatility(price, S, K, T, isCall, r = 0.065) {
 }
 
 /**
+ * Forward (synthetic futures) price from put-call parity at a single strike:
+ *     F = (CE - PE) * e^{rT} + K
+ * Index options are priced off the FORWARD, not spot. On NIFTY the forward sits
+ * 10-25 points above spot intraday, so solving IV against spot pushes every call
+ * IV down and every put IV up by ~0.4-0.5 vol points and invents a CE/PE skew
+ * that cannot exist — parity forces one IV per strike. Use the ATM strike, where
+ * both legs are liquid and the parity residual is smallest.
+ *
+ * @param {number} ceLtp  ATM call price
+ * @param {number} peLtp  ATM put price
+ * @param {number} K      ATM strike
+ * @param {number} T      Time to expiry in years
+ * @param {number} r      Risk-free rate
+ * @returns {number|null} Forward price, or null if inputs are unusable
+ */
+export function forwardFromParity(ceLtp, peLtp, K, T, r = 0.065) {
+  if (![ceLtp, peLtp, K, T].every((v) => isFinite(v) && v > 0)) return null;
+  const F = (ceLtp - peLtp) * Math.exp(r * T) + K;
+  // Sanity band: a forward more than 5% away from the strike it was derived at
+  // means a stale or crossed quote, not a real basis.
+  if (!isFinite(F) || F <= 0 || Math.abs(F / K - 1) > 0.05) return null;
+  return F;
+}
+
+/**
+ * Implied volatility solved against the FORWARD (Black-76) rather than spot.
+ *
+ * Black-76 is Black-Scholes evaluated at S = F * e^{-rT}: substituting that into
+ * the BS d1 cancels the rT drift term exactly, leaving d1 = (ln(F/K) + sigma^2 T/2)
+ * / (sigma sqrt(T)) and price = e^{-rT}[F N(d1) - K N(d2)]. So we can reuse the
+ * solver below verbatim instead of maintaining a second one.
+ *
+ * @param {number} price  Option market price (LTP)
+ * @param {number} F      Forward price
+ * @param {number} K      Strike
+ * @param {number} T      Time to expiry in years
+ * @param {boolean} isCall
+ * @param {number} r      Risk-free rate
+ * @returns {number|null} IV as percent, or null
+ */
+export function impliedVolatilityFwd(price, F, K, T, isCall, r = 0.065) {
+  if (!isFinite(F) || F <= 0 || !isFinite(T) || T <= 0) return null;
+  return impliedVolatility(price, F * Math.exp(-r * T), K, T, isCall, r);
+}
+
+/**
  * Time to expiry in years, assuming Indian options expire at 15:30 IST.
  * @param {Date} expiryDate Date object pointing at expiry day 15:30 IST
  * @param {number} nowMs    Current epoch ms
