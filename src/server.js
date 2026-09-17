@@ -243,6 +243,11 @@ function requireAuth(req, res, next) {
   next();
 }
 
+// Where snapshots live. Kept in one place so the reader and the writer
+// (src/signal/oiSnapshotWriter.js) can never drift apart.
+const dataRoot = () =>
+  process.env.FNO_DATA_ROOT || path.join(process.cwd(), "data", "fno");
+
 app.get("/health", (_req, res) => res.json({ ok: true }));
 
 // Shared session endpoint: returns the most recent valid login so any visitor
@@ -334,13 +339,46 @@ app.get("/api/oi/state", requireAuth, (_req, res) => {
 // List how many days of OI snapshots are preserved on disk (no auth needed).
 app.get("/api/oi/history-days", (_req, res) => {
   try {
-    const root = process.env.FNO_DATA_ROOT
-      || path.join(process.cwd(), "data", "fno");
-    const dir = path.join(root, "snapshots", "NIFTY");
+    const dir = path.join(dataRoot(), "snapshots", "NIFTY");
     if (!nodeFs.existsSync(dir)) return res.json({ days: [], count: 0 });
     const files = nodeFs.readdirSync(dir).filter(f => /^\d{8}\.jsonl$/.test(f));
     const days = files.map(f => f.slice(0, 8)).sort().reverse();
     res.json({ days, count: days.length });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Read back one stored day of OI snapshots. Without this the snapshots were
+// written to disk and then unreachable — history-days could only tell you how
+// many files existed, so nothing could ever be backtested.
+//   /api/oi/history/20260917            -> all rows for that day
+//   /api/oi/history/20260917?strike=23300&opt=CE
+app.get("/api/oi/history/:day", requireAuth, (req, res) => {
+  try {
+    const day = String(req.params.day || "");
+    if (!/^\d{8}$/.test(day)) {
+      return res.status(400).json({ error: "day must be YYYYMMDD" });
+    }
+    const dir = path.join(dataRoot(), "snapshots", "NIFTY");
+    // Rebuild the path from the validated day only, so the param can never
+    // escape the snapshots directory.
+    const file = path.join(dir, `${day}.jsonl`);
+    if (!nodeFs.existsSync(file)) return res.status(404).json({ error: "no data for that day" });
+
+    const strike = req.query.strike != null ? Number(req.query.strike) : null;
+    const opt = req.query.opt ? String(req.query.opt).toUpperCase() : null;
+
+    const rows = [];
+    for (const line of nodeFs.readFileSync(file, "utf8").split("\n")) {
+      if (!line) continue;
+      let row;
+      try { row = JSON.parse(line); } catch { continue; }
+      if (strike != null && row.strike !== strike) continue;
+      if (opt && row.opt_type !== opt) continue;
+      rows.push(row);
+    }
+    res.json({ day, count: rows.length, rows });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }

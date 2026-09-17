@@ -13,5 +13,9 @@ services:
     envVars:
       - key: NODE_VERSION
         value: 20
-      - key: DATA_DIR
-        value: /data
+      # Must match what the code reads (src/signal/oiSnapshotWriter.js,
+      # src/paper/*.js). This previously said DATA_DIR, which nothing reads —
+      # so every snapshot and paper-trade journal was written to the ephemeral
+      # container filesystem and lost on each deploy/restart.
+      - key: FNO_DATA_ROOT
+        value: /data/fno

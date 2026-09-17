@@ -8,10 +8,15 @@ export const STRIKE_STEP = {
   SENSEX: 100,
 };
 
+// FALLBACK ONLY. The live lot size comes from the broker's instrument master
+// (see loadInstruments in src/brokers/angelMarketData.js) and is threaded through
+// the OI tick; this table is used only when that lookup fails. Verified against
+// the Angel master on 2026-09-17 — NIFTY was 75 here while the exchange had
+// already moved it to 65, which overstated every paper P&L by 15.4%.
 export const LOT_SIZE = {
-  NIFTY: 75,
+  NIFTY: 65,
   BANKNIFTY: 30,
-  FINNIFTY: 65,
+  FINNIFTY: 60,
   MIDCPNIFTY: 120,
   SENSEX: 20,
 };

@@ -172,7 +172,10 @@ function tryOpen(state, book, sigDir, bias, net, tick) {
   // Premium range filter — skip too-cheap or too-expensive strikes
   if (ltp < (cfg.premiumMin || 0) || ltp > (cfg.premiumMax || Infinity)) return;
 
-  const lotSize = LOT_SIZE[cfg.symbol] || 75;
+  // Prefer the lot size the runner read out of the broker's instrument master;
+  // the LOT_SIZE table is only a fallback and goes stale every time the exchange
+  // revises a contract (NIFTY has already gone 75 -> 65).
+  const lotSize = tick.lotSize || LOT_SIZE[cfg.symbol] || 75;
   const qty = lotSize * cfg.lots;
   const entryPremium = round2(ltp * (1 + cfg.slippagePct / 100));
   const premiumCost = entryPremium * qty;
@@ -346,8 +349,15 @@ export function onOiTick(tick) {
     const sigDir = Number.isFinite(tick.net) ? (tick.net > 0 ? "BULL" : "BEAR") : null;
     if (strong && sigDir) {
       if (confirm.dir === sigDir) {
-        confirm.count++;
-        confirm.nets.push(tick.net);
+        // Exchange OI updates once a minute while we poll every 30s, so roughly
+        // every other tick repeats the previous OI verbatim. Counting those as
+        // independent confirmations halves the real confirmation window: three
+        // "ticks" could be as little as one genuine OI update. Only advance the
+        // count when the OI actually moved.
+        if (tick.oiChanged !== false) {
+          confirm.count++;
+          confirm.nets.push(tick.net);
+        }
       } else {
         confirm = { dir: sigDir, count: 1, nets: [tick.net] };
       }

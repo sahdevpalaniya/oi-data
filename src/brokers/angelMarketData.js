@@ -31,6 +31,10 @@ export async function loadInstruments() {
       name: row.name,
       exchange: row.exch_seg,
       instrumentType: row.instrumenttype,
+      // Contract lot size straight from the master. NIFTY's lot has changed
+      // several times (75 -> 65 -> ...), so never hardcode it: a stale constant
+      // silently scales every P&L figure by the wrong factor.
+      lotSize: Number(row.lotsize) || null,
     });
   }
   return instrumentCache;
