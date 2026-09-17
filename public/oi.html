@@ -671,6 +671,9 @@
         window.location.href = "/index.html";
       });
 
+      // Surfaced by the status line when the tracker will not start.
+      let lastStartError = null;
+
       // Auto-recovery: if the tracker isn't running (e.g. after server restart),
       // and we have a valid session, kick it back on. Idempotent server-side.
       async function ensureTrackerRunning() {
@@ -679,11 +682,22 @@
           if (handle401(r)) return;
           const s = await r.json();
           if (s.status === "idle" || s.status === "finished" || s.status === "error") {
-            await fetch("/api/oi/start", {
+            const start = await fetch("/api/oi/start", {
               method: "POST",
               headers: { ...authHeaders(), "Content-Type": "application/json" },
               body: JSON.stringify({}),
             });
+            if (!start.ok) {
+              // The server keeps the SmartAPI key in memory keyed by JWT, so a
+              // deploy or restart drops it and auto-recovery cannot restart the
+              // tracker. That used to fail silently into the console while the
+              // page just said "not running" — say what actually happened.
+              let why = "";
+              try { why = (await start.json()).error || ""; } catch {}
+              lastStartError = why || ("start failed (" + start.status + ")");
+            } else {
+              lastStartError = null;
+            }
           }
         } catch {}
       }
@@ -928,7 +942,12 @@
           } else if (s.status === "error") {
             setStatus("err", "Error: " + escHtml(s.error || "unknown") + " — please re-login.");
           } else if (s.status === "idle" || s.status === "finished") {
-            setStatus("", "Not running yet — log in to start auto-tracking.");
+            setStatus(lastStartError ? "err" : "",
+              lastStartError
+                ? "Tracker could not start — " + escHtml(lastStartError)
+                  + ". (Set <code>ANGEL_API_KEY</code> on the server so it can restart itself "
+                  + "after a deploy instead of waiting for a manual login.)"
+                : "Not running yet — log in to start auto-tracking.");
           }
         } catch {}
       }
